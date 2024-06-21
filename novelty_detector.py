@@ -84,18 +84,18 @@ def extract_statistics(cfg, train_set, inliner_classes, E, G):
 
     return counts, bin_edges, gennorm_param
 
-def run_novely_prediction_on_images(images, inliner_classes, cfg, counts, bin_edges, gennorm_param, threshold, E, G):
+def run_novely_prediction_on_images(images, inliner_classes, cfg, counts, bin_edges, gennorm_param, threshold=None, E=None, G=None):
     device = torch.cuda.current_device()
 
     def logPe_func(x):
-        N = (cfg.MODEL.INPUT_IMAGE_SIZE * cfg.MODEL.INPUT_IMAGE_SIZE - cfg.MODEL.LATENT_SIZE) * 1.0
+        N = (cfg.MODEL.INPUT_IMAGE_SIZE * cfg.MODEL.INPUT_IMAGE_SIZE - cfg.MODEL.LATENT_SIZE) * cfg.TRAIN.MUL
         logC = loggamma(N / 2.0) - (N / 2.0) * np.log(2.0 * np.pi)
         return logC - (N - 1) * np.log(x) + np.log(r_pdf(x, bin_edges, counts))
 
     results = []
     gt_novel = []
 
-    for label, image in images:
+    for image, label in images:  # Assumendo che `images` sia una lista di tuple (image, label)
         x = image.view(-1, cfg.MODEL.INPUT_IMAGE_CHANNELS * cfg.MODEL.INPUT_IMAGE_SIZE * cfg.MODEL.INPUT_IMAGE_SIZE)
         x = Variable(x.data, requires_grad=True).to(device)
 
@@ -118,11 +118,16 @@ def run_novely_prediction_on_images(images, inliner_classes, cfg, counts, bin_ed
 
         P = logPe + logPz
 
-        result = 'in' if P > threshold else 'out'
-        results.append(result)
+        if threshold is not None:
+            result = 'in' if P > threshold else 'out'
+            results.append(result)
+
         gt_novel.append(label in inliner_classes)
 
-    return results, gt_novel
+    results = np.asarray(results, dtype=np.float32) if results else None
+    ground_truth = np.asarray(gt_novel, dtype=np.float32)
+    return results, ground_truth
+
 
 def compute_threshold(valid_set, inliner_classes, percentage, cfg, counts, bin_edges, gennorm_param, E, G):
     print("Computing threshold...")  # Debug statement
@@ -163,6 +168,11 @@ def main_inference(inliner_classes, outliner_classes, cfg):
 
     train_set, test_set = make_datasets(cfg, inliner_classes)
 
+    print('Train set size: %d' % len(train_set))
+    print('Test set size: %d' % len(test_set))
+
+    train_set.shuffle()
+
     G = Generator(cfg.MODEL.LATENT_SIZE, channels=cfg.MODEL.INPUT_IMAGE_CHANNELS)
     E = Encoder(cfg.MODEL.LATENT_SIZE, channels=cfg.MODEL.INPUT_IMAGE_CHANNELS)
 
@@ -172,20 +182,23 @@ def main_inference(inliner_classes, outliner_classes, cfg):
     G.eval()
     E.eval()
 
+    sample = torch.randn(64, cfg.MODEL.LATENT_SIZE).to(device)
+    sample = G(sample.view(-1, cfg.MODEL.LATENT_SIZE, 1, 1)).cpu()
+    save_image(sample.view(64, cfg.MODEL.INPUT_IMAGE_CHANNELS, cfg.MODEL.INPUT_IMAGE_SIZE, cfg.MODEL.INPUT_IMAGE_SIZE), 'sample.png')
+
     counts, bin_edges, gennorm_param = extract_statistics(cfg, train_set, inliner_classes, E, G)
 
-    # Calcolo della threshold
-    valid_set = [(label, image) for label, image in zip([test_set[i][0] for i in range(5)], [test_set[i][1] for i in range(5)])]  # Usare un subset del test_set come validazione per calcolare la soglia
+    valid_set = [(test_set[i][1], test_set[i][0]) for i in range(5)]  # Assumendo che test_set sia una lista di tuple (label, image)
     threshold = compute_threshold(valid_set, inliner_classes, cfg.DATASET.PERCENTAGES[0], cfg, counts, bin_edges, gennorm_param, E, G)
 
-    # Eseguiamo l'inferenza su un set di immagini in-domain e out-of-domain
-    inliner_images = [(test_set[i][0], test_set[i][1]) for i in range(5)]  # Prendiamo 5 immagini in-domain a caso
-    outliner_images = [(MNISTDataset(cfg.DATASET.PATH_OUT, transform=transforms.ToTensor())[i][0], MNISTDataset(cfg.DATASET.PATH_OUT, transform=transforms.ToTensor())[i][1]) for i in range(5)]  # Prendiamo 5 immagini out-of-domain a caso
+    inliner_images = [(test_set[i][1], test_set[i][0]) for i in range(5)]  # Assumendo che test_set sia una lista di tuple (label, image)
+    outliner_images = [(MNISTDataset(cfg.DATASET.PATH_OUT, transform=transforms.ToTensor())[i][1], MNISTDataset(cfg.DATASET.PATH_OUT, transform=transforms.ToTensor())[i][0]) for i in range(5)]  # Prendiamo 5 immagini out-of-domain a caso
 
-    inliner_results, inliner_truth = run_novely_prediction_on_images(inliner_images, inliner_classes, cfg, counts, bin_edges, gennorm_param, threshold, E, G)
-    outliner_results, outliner_truth = run_novely_prediction_on_images(outliner_images, inliner_classes, cfg, counts, bin_edges, gennorm_param, threshold, E, G)
+    inliner_results = run_novely_prediction_on_images(inliner_images, inliner_classes, cfg, counts, bin_edges, gennorm_param, threshold, E, G)
+    outliner_results = run_novely_prediction_on_images(outliner_images, inliner_classes, cfg, counts, bin_edges, gennorm_param, threshold, E, G)
 
     print("Inliner Results: ", inliner_results)
     print("Outliner Results: ", outliner_results)
 
     return inliner_results, outliner_results
+
