@@ -7,13 +7,14 @@ import numpy as np
 import logging
 import os
 import scipy.optimize
-from dataloading import make_datasets, make_dataloader
+from dataloading import make_datasets
 from evaluation import get_f1, evaluate
 from utils.threshold_search import find_maximum
 from utils.save_plot import save_plot
 import matplotlib.pyplot as plt
 import scipy.stats
 from scipy.special import loggamma
+
 
 def r_pdf(x, bins, counts):
     if bins[0] < x < bins[-1]:
@@ -23,53 +24,30 @@ def r_pdf(x, bins, counts):
         return max(counts[0] * x / bins[0], 1e-308)
     return 1e-308
 
-def extract_statistics(cfg, train_set, inliner_classes, E, G):
+def extract_statistics(cfg, train_set, E, G):
     zlist = []
     rlist = []
 
-    data_loader = make_dataloader(train_set, cfg.TEST.BATCH_SIZE, torch.cuda.current_device())
+    device = torch.cuda.current_device()
+    E.to(device)
+    G.to(device)
 
-    for label, x in data_loader:
-        print("Original x type:", x.dtype, "device:", x.device)  # Debugging statement
-        x = x.view(-1, cfg.MODEL.INPUT_IMAGE_SIZE * cfg.MODEL.INPUT_IMAGE_SIZE)
-        print("Reshaped x type:", x.dtype, "device:", x.device)  # Debugging statement
-        x = x.to(torch.device("cuda" if torch.cuda.is_available() else "cpu")).float()
-        print("Converted x type:", x.dtype, "device:", x.device)  # Debugging statement
-
-        z = E(x.view(-1, 1, cfg.MODEL.INPUT_IMAGE_SIZE, cfg.MODEL.INPUT_IMAGE_SIZE))
-        recon_batch = G(z)
+    for label, x in train_set:
+        x = x.view(-1, 1, cfg.MODEL.INPUT_IMAGE_SIZE, cfg.MODEL.INPUT_IMAGE_SIZE).to(device).float()
+        z = E(x).view(x.size(0), -1)
+        z = z.unsqueeze(0) if z.dim() == 1 else z
+        recon_batch = G(z.view(-1, cfg.MODEL.LATENT_SIZE, 1, 1))
         z = z.squeeze()
-
         recon_batch = recon_batch.squeeze().cpu().detach().numpy()
         x = x.squeeze().cpu().detach().numpy()
-
         z = z.cpu().detach().numpy()
 
-        for i in range(x.shape[0]):
-            distance = np.linalg.norm(x[i].flatten() - recon_batch[i].flatten())
-            rlist.append(distance)
-
+        distance = np.linalg.norm(x.flatten() - recon_batch.flatten())
+        rlist.append(distance)
         zlist.append(z)
 
-    zlist = np.concatenate(zlist)
-
+    zlist = np.array(zlist)
     counts, bin_edges = np.histogram(rlist, bins=30, density=True)
-
-    if cfg.MAKE_PLOTS:
-        plt.plot(bin_edges[1:], counts, linewidth=2)
-        save_plot(r"Distance, $\left \|\| I - \hat{I} \right \|\|$",
-                  'Probability density',
-                  r"PDF of distance for reconstruction error, $p\left(\left \|\| I - \hat{I} \right \|\| \right)$",
-                  cfg.OUTPUT_FOLDER + '/mnist_%s_reconstruction_error.pdf' % ("_".join([str(x) for x in inliner_classes])))
-
-    for i in range(cfg.MODEL.LATENT_SIZE):
-        plt.hist(zlist[:, i], bins='auto', histtype='step')
-
-    if cfg.MAKE_PLOTS:
-        save_plot(r"$z$",
-                  'Probability density',
-                  r"PDF of embedding $p\left(z \right)$",
-                  cfg.OUTPUT_FOLDER + '/mnist_%s_embedding.pdf' % ("_".join([str(x) for x in inliner_classes])))
 
     def fmin(func, x0, args, disp):
         x0 = [2.0, 0.0, 1.0]
@@ -84,31 +62,42 @@ def extract_statistics(cfg, train_set, inliner_classes, E, G):
 
     return counts, bin_edges, gennorm_param
 
-def run_novely_prediction_on_images(images, inliner_classes, cfg, counts, bin_edges, gennorm_param, threshold=None, E=None, G=None):
-    device = torch.cuda.current_device()
-
-    def logPe_func(x):
-        N = (cfg.MODEL.INPUT_IMAGE_SIZE * cfg.MODEL.INPUT_IMAGE_SIZE - cfg.MODEL.LATENT_SIZE) * cfg.TRAIN.MUL
-        logC = loggamma(N / 2.0) - (N / 2.0) * np.log(2.0 * np.pi)
-        return logC - (N - 1) * np.log(x) + np.log(r_pdf(x, bin_edges, counts))
-
+def run_novely_prediction_on_images(images, labels, inliner_classes, cfg, counts, bin_edges, gennorm_param, threshold=None, E=None, G=None):
     results = []
     gt_novel = []
 
-    for image, label in images:  # Assumendo che `images` sia una lista di tuple (image, label)
-        x = image.view(-1, cfg.MODEL.INPUT_IMAGE_CHANNELS * cfg.MODEL.INPUT_IMAGE_SIZE * cfg.MODEL.INPUT_IMAGE_SIZE)
-        x = Variable(x.data, requires_grad=True).to(device)
+    include_jacobian = True
 
+    N = (cfg.MODEL.INPUT_IMAGE_SIZE * cfg.MODEL.INPUT_IMAGE_SIZE - cfg.MODEL.LATENT_SIZE) * cfg.DATASET.PERCENTAGES[0]
+    logC = loggamma(N / 2.0) - (N / 2.0) * np.log(2.0 * np.pi)
+
+    def logPe_func(x):
+        return logC - (N - 1) * np.log(x) + np.log(r_pdf(x, bin_edges, counts))
+
+    for i, (label, x) in enumerate(zip(labels, images)):
+        print(f"Processing image {i+1}/{len(images)}")
+        x = x.view(-1, cfg.MODEL.INPUT_IMAGE_CHANNELS * cfg.MODEL.INPUT_IMAGE_SIZE * cfg.MODEL.INPUT_IMAGE_SIZE)
+        x = Variable(x.data, requires_grad=True).to(torch.device("cuda" if torch.cuda.is_available() else "cpu")).float()
+        x.retain_grad()
         z = E(x.view(-1, cfg.MODEL.INPUT_IMAGE_CHANNELS, cfg.MODEL.INPUT_IMAGE_SIZE, cfg.MODEL.INPUT_IMAGE_SIZE))
-        recon_batch = G(z)
         z = z.squeeze()
+
+        recon_batch = G(z.view(-1, cfg.MODEL.LATENT_SIZE, 1, 1))
+        z = z.squeeze()
+
+        if include_jacobian:
+            J = compute_jacobian_autograd(x, z)
+            J = J.cpu().numpy()
 
         z = z.cpu().detach().numpy()
         recon_batch = recon_batch.squeeze().cpu().detach().numpy()
         x = x.squeeze().cpu().detach().numpy()
 
-        distance = np.linalg.norm(x.flatten() - recon_batch.flatten())
-        logPe = logPe_func(distance)
+        if include_jacobian:
+            u, s, vh = np.linalg.svd(J, full_matrices=False)
+            logD = -np.sum(np.log(np.abs(s)))
+        else:
+            logD = 0
 
         p = scipy.stats.gennorm.pdf(z, gennorm_param[0, :], gennorm_param[1, :], gennorm_param[2, :])
         logPz = np.sum(np.log(p))
@@ -116,29 +105,22 @@ def run_novely_prediction_on_images(images, inliner_classes, cfg, counts, bin_ed
         if not np.isfinite(logPz):
             logPz = -1000
 
-        P = logPe + logPz
+        distance = np.linalg.norm(x.flatten() - recon_batch.flatten())
+        logPe = logPe_func(distance)
 
-        if threshold is not None:
-            result = 'in' if P > threshold else 'out'
-            results.append(result)
+        P = logD + logPz + logPe
 
+        result = 'in' if threshold is not None and P > threshold else 'out'
+        results.append(P if threshold is None else (1 if result == 'in' else 0))
         gt_novel.append(label in inliner_classes)
 
-    results = np.asarray(results, dtype=np.float32) if results else None
-    ground_truth = np.asarray(gt_novel, dtype=np.float32)
-    return results, ground_truth
+    return np.asarray(results, dtype=np.float32), np.asarray(gt_novel, dtype=np.float32)
 
-
-def compute_threshold(valid_set, inliner_classes, percentage, cfg, counts, bin_edges, gennorm_param, E, G):
-    print("Computing threshold...")  # Debug statement
-    y_scores, y_true = run_novely_prediction_on_images(valid_set, inliner_classes, cfg, counts, bin_edges, gennorm_param, threshold=None, E=E, G=G)
-
-    if y_scores is None or y_true is None:
-        raise ValueError("y_scores or y_true are None")
-
-    print("y_scores:", y_scores)  # Debug statement
-    print("y_true:", y_true)  # Debug statement
-
+def compute_threshold(images, labels, inliner_classes, cfg, counts, bin_edges, gennorm_param, E, G):
+    logger = logging.getLogger("logger")
+    y_scores, y_true = run_novely_prediction_on_images(images, labels, inliner_classes, cfg, counts, bin_edges, gennorm_param, threshold=None, E=E, G=G)
+    
+    y_scores = np.array([score for score in y_scores], dtype=np.float32)
     minP = min(y_scores) - 1
     maxP = max(y_scores) + 1
     y_false = np.logical_not(y_true)
@@ -152,12 +134,8 @@ def compute_threshold(valid_set, inliner_classes, percentage, cfg, counts, bin_e
 
     best_th, best_f1 = find_maximum(evaluate, minP, maxP, 1e-4)
 
-    if best_th is None:
-        raise ValueError("Threshold calculation failed")
-
     logger.info("Best e: %f best f1: %f" % (best_th, best_f1))
     return best_th
-
 
 def main_inference(inliner_classes, outliner_classes, cfg):
     logger = logging.getLogger("logger")
@@ -186,19 +164,21 @@ def main_inference(inliner_classes, outliner_classes, cfg):
     sample = G(sample.view(-1, cfg.MODEL.LATENT_SIZE, 1, 1)).cpu()
     save_image(sample.view(64, cfg.MODEL.INPUT_IMAGE_CHANNELS, cfg.MODEL.INPUT_IMAGE_SIZE, cfg.MODEL.INPUT_IMAGE_SIZE), 'sample.png')
 
-    counts, bin_edges, gennorm_param = extract_statistics(cfg, train_set, inliner_classes, E, G)
+    counts, bin_edges, gennorm_param = extract_statistics(cfg, train_set, E, G)
 
-    valid_set = [(test_set[i][1], test_set[i][0]) for i in range(5)]  # Assumendo che test_set sia una lista di tuple (label, image)
-    threshold = compute_threshold(valid_set, inliner_classes, cfg.DATASET.PERCENTAGES[0], cfg, counts, bin_edges, gennorm_param, E, G)
+    inliner_images = [train_set[i][1] for i in range(5)]
+    inliner_labels = [train_set[i][0] for i in range(5)]
+    outliner_images = [test_set[i][1] for i in range(5)]
+    outliner_labels = [test_set[i][0] for i in range(5)]
 
-    inliner_images = [(test_set[i][1], test_set[i][0]) for i in range(5)]  # Assumendo che test_set sia una lista di tuple (label, image)
-    outliner_images = [(MNISTDataset(cfg.DATASET.PATH_OUT, transform=transforms.ToTensor())[i][1], MNISTDataset(cfg.DATASET.PATH_OUT, transform=transforms.ToTensor())[i][0]) for i in range(5)]  # Prendiamo 5 immagini out-of-domain a caso
+    threshold = compute_threshold(inliner_images, inliner_labels, inliner_classes, cfg, counts, bin_edges, gennorm_param, E, G)
 
-    inliner_results = run_novely_prediction_on_images(inliner_images, inliner_classes, cfg, counts, bin_edges, gennorm_param, threshold, E, G)
-    outliner_results = run_novely_prediction_on_images(outliner_images, inliner_classes, cfg, counts, bin_edges, gennorm_param, threshold, E, G)
+    results_in, _ = run_novely_prediction_on_images(inliner_images, inliner_labels, inliner_classes, cfg, counts, bin_edges, gennorm_param, threshold, E, G)
+    results_out, _ = run_novely_prediction_on_images(outliner_images, outliner_labels, inliner_classes, cfg, counts, bin_edges, gennorm_param, threshold, E, G)
 
-    print("Inliner Results: ", inliner_results)
-    print("Outliner Results: ", outliner_results)
+    results = {
+        'inliner_results': results_in,
+        'outliner_results': results_out
+    }
 
-    return inliner_results, outliner_results
-
+    return results
